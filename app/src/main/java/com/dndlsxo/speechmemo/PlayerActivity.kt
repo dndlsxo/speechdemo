@@ -18,8 +18,9 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.text.InputType
 import android.widget.Button
-import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -67,7 +68,10 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
 
     private var mode = 0
     private var blankLevel = 0
-    private var loopAll = false
+    /** How many times to play the whole script: 1 = once, 0 = forever. */
+    private var loopCount = 1
+    /** Which pass through the script is playing now (1-based). Kept across pause/resume. */
+    private var passNo = 1
     private var rate = 1.0f
 
     /** Delays between sentences (cleared on pause). */
@@ -81,6 +85,7 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var listBox: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var playBtn: Button
+    private lateinit var loopBtn: Button
 
     private val listener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {}
@@ -109,7 +114,8 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
         rate = prefs.getFloat("rate", 1.0f)
         mode = prefs.getInt("mode", 0)
         blankLevel = prefs.getInt("blank", 0)
-        loopAll = prefs.getBoolean("loop", false)
+        // Older builds stored an on/off "loop" flag; treat "on" as repeat forever.
+        loopCount = prefs.getInt("loops", if (prefs.getBoolean("loop", false)) 0 else 1)
 
         buildUi()
         if (!loadScript()) {
@@ -235,15 +241,11 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
                 override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
         }
-        val loopBox = CheckBox(this).apply {
-            text = "전체 반복"
-            isChecked = loopAll
-            setOnCheckedChangeListener { _, c ->
-                loopAll = c
-                prefs.edit().putBoolean("loop", c).apply()
-            }
+        loopBtn = Button(this).apply {
+            text = loopButtonText()
+            setOnClickListener { chooseLoopCount() }
         }
-        panel.addView(row(spinner, loopBox, stretch = setOf(0)))
+        panel.addView(row(spinner, loopBtn, stretch = setOf(0)))
 
         // Transport buttons
         val prevBtn = Button(this).apply {
@@ -266,6 +268,63 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun speedText() = "속도: " + String.format(Locale.US, "%.2f", rate) + "x"
 
+    private fun loopLabel(n: Int) = when (n) {
+        0 -> "무한 반복"
+        1 -> "반복 없음"
+        else -> "${n}번 반복"
+    }
+
+    private fun loopButtonText() = "🔁 " + loopLabel(loopCount)
+
+    private fun chooseLoopCount() {
+        val presets = intArrayOf(1, 2, 3, 5, 10, 0)
+        val labels = presets.map { n ->
+            val base = if (n == 1) "반복 없음 (한 번 듣고 멈춤)" else loopLabel(n)
+            if (n == loopCount) "$base  ✓" else base
+        }.toMutableList()
+        val custom = loopCount !in presets
+        labels.add(if (custom) "직접 입력… (지금 ${loopCount}번)  ✓" else "직접 입력…")
+        AlertDialog.Builder(this)
+            .setTitle("원고 전체를 몇 번 들을까요?")
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which < presets.size) setLoopCount(presets[which]) else askCustomLoopCount()
+            }
+            .setNegativeButton("닫기", null)
+            .show()
+    }
+
+    private fun askCustomLoopCount() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "1 ~ 99"
+            if (loopCount > 0) setText(loopCount.toString())
+            selectAll()
+        }
+        val box = LinearLayout(this).apply {
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(input, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("반복 횟수 입력")
+            .setMessage("원고 전체를 이 횟수만큼 듣고 멈춰요.")
+            .setView(box)
+            .setPositiveButton("확인") { _, _ ->
+                val n = input.text.toString().toIntOrNull()
+                if (n == null || n < 1 || n > 99) toast("1부터 99 사이의 숫자를 넣어 주세요.") else setLoopCount(n)
+            }
+            .setNegativeButton("취소", null)
+            .show()
+    }
+
+    private fun setLoopCount(n: Int) {
+        loopCount = n
+        passNo = 1
+        loopBtn.text = loopButtonText()
+        prefs.edit().putInt("loops", n).remove("loop").apply()
+        updateStatus()
+        toast(if (n == 1) "한 번 듣고 멈춰요." else if (n == 0) "멈출 때까지 계속 반복해요." else "원고 전체를 ${n}번 듣고 멈춰요.")
+    }
+
     private fun simpleSeek(onChange: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
             if (fromUser) onChange(progress)
@@ -280,6 +339,7 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
         title = s.title
         sentences = TextParser.parse(s.body)
         revealed.clear()
+        passNo = 1
         current = current.coerceIn(0, maxOf(0, sentences.size - 1))
         buildSentenceViews()
         updateStatus()
@@ -345,7 +405,11 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
         statusText.text = when {
             sentences.isEmpty() -> ""
             else -> {
-                val base = "문장 ${current + 1} / ${sentences.size} · 단락 ${sentences[current].para + 1} / ${TextParser.paragraphCount(sentences)}"
+                var base = "문장 ${current + 1} / ${sentences.size} · 단락 ${sentences[current].para + 1} / ${TextParser.paragraphCount(sentences)}"
+                when {
+                    loopCount == 0 -> base += " · 반복 ${passNo}회째 (무한)"
+                    loopCount > 1 -> base += " · 반복 $passNo / $loopCount"
+                }
                 if (ttsReady) base else "$base · 음성 엔진 준비 중…"
             }
         }
@@ -439,15 +503,18 @@ class PlayerActivity : Activity(), TextToSpeech.OnInitListener {
             }
         }
         if (next >= sentences.size) {
-            if (loopAll) {
+            if (loopCount == 0 || passNo < loopCount) {
+                passNo++
                 next = 0
                 gap = 2000L
             } else {
+                val done = passNo
                 pausePlayback()
+                passNo = 1
                 current = 0
                 highlight(false)
                 updateStatus()
-                toast("끝까지 읽었어요.")
+                toast(if (done > 1) "${done}번 반복을 마쳤어요." else "끝까지 읽었어요.")
                 return
             }
         }
