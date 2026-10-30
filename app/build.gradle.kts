@@ -11,14 +11,28 @@ android {
         applicationId = "com.dndlsxo.speechmemo"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.1.1"
+    }
+
+    // One fixed key for every build, so a new APK installs over the old one.
+    // (CI otherwise generates a fresh debug key per run, and Android rejects the update.)
+    signingConfigs {
+        create("fixed") {
+            storeFile = file("speechmemo.keystore")
+            storePassword = "speechmemo"
+            keyAlias = "speechmemo"
+            keyPassword = "speechmemo"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("fixed")
+        }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("fixed")
         }
     }
 
